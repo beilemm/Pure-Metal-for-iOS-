@@ -1,0 +1,62 @@
+workflows:
+  puremetal-ios:
+    name: Pure Metal iOS dylib
+    instance_type: mac_mini_m2
+    max_build_duration: 30
+    environment:
+      xcode: latest        # Metal 4 / MetalFX can Xcode 26 tro len
+      vars:
+        MIN_IOS: "16.0"    # doi thanh 26.0 neu code goi thang API Metal 4
+        SRC_DIR: "src"     # thu muc chua source (.mm / .cpp / .m / .metal)
+        OUT_NAME: "libpuremetal.dylib"
+    scripts:
+      - name: Kiem tra source con dung AppKit khong
+        script: |
+          if grep -rEn "AppKit|NSView|NSWindow|NSScreen|NSApplication" "$SRC_DIR"; then
+            echo "!!! Con code AppKit - phai doi sang UIKit hoac chi dung CAMetalLayer"
+            exit 1
+          fi
+
+      - name: Compile shader .metal (neu co)
+        script: |
+          mkdir -p build
+          METALS=$(find "$SRC_DIR" -name "*.metal")
+          if [ -n "$METALS" ]; then
+            for f in $METALS; do
+              xcrun -sdk iphoneos metal -c "$f" \
+                -miphoneos-version-min=$MIN_IOS \
+                -o "build/$(basename "$f" .metal).air"
+            done
+            xcrun -sdk iphoneos metallib build/*.air -o build/default.metallib
+          fi
+
+      - name: Build dylib iOS arm64
+        script: |
+          FILES=$(find "$SRC_DIR" \( -name "*.mm" -o -name "*.m" -o -name "*.cpp" \))
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -miphoneos-version-min=$MIN_IOS \
+            -std=c++20 -fobjc-arc -O2 -fvisibility=hidden \
+            -dynamiclib \
+            -install_name "@rpath/$OUT_NAME" \
+            -framework Metal -framework MetalFX \
+            -framework QuartzCore -framework Foundation \
+            -framework UIKit -framework IOSurface \
+            -framework CoreGraphics -framework CoreFoundation \
+            $FILES \
+            -o "build/$OUT_NAME"
+
+      - name: Ky ad-hoc
+        script: codesign -f -s - "build/$OUT_NAME"
+
+      - name: Kiem tra platform (phai ra IOS, khong phai MACOS)
+        script: |
+          vtool -show-build "build/$OUT_NAME"
+          otool -L "build/$OUT_NAME"
+          lipo -info "build/$OUT_NAME"
+          vtool -show-build "build/$OUT_NAME" | grep -q "platform IOS"
+
+    artifacts:
+      - build/libpuremetal.dylib
+      - build/*.metallib
