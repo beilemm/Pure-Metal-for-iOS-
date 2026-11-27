@@ -1,0 +1,537 @@
+# =============================================================================
+# Codemagic CI/CD - build the Pure Metal Fabric mod (jar + native libpuremetal.dylib)
+#
+# Upstream project : https://github.com/imCinq/pure-metal  (Apache-2.0, (c) imCinq)
+# Default ref      : v0.4.4.1  (the same version as pure-metal-0.4.4.1_2.jar)
+# Output           : pure-metal-<version>.jar  (contains natives/libpuremetal.dylib)
+#                    libpuremetal.dylib, exports.txt, SHA-256 checksums
+#
+# IMPORTANT
+#  * Workflow "pure-metal-jar" = macOS arm64 build. Workflow "pure-metal-ios" = iOS arm64 variant (untested).
+#    It links AppKit / Metal / MetalFX / IOSurface, so it runs on Macs only.
+#    It will NOT load on iOS / iPhone launchers.
+#  * Needs Minecraft 26.3, Fabric Loader >= 0.19.0, Java >= 25 (as in fabric.mod.json).
+#
+# HOW TO USE
+#  1. Put this file at the root of ANY git repo (it may contain only this file).
+#  2. Add that repo to Codemagic and choose "codemagic.yaml" as the configuration.
+#  3. Start the "pure-metal-jar" workflow. To build another version change
+#     UPSTREAM_REF below (for example v0.5.3 or main), or override it per build.
+# =============================================================================
+
+workflows:
+  pure-metal-jar:
+    name: Pure Metal - build jar (macOS arm64)
+    instance_type: mac_mini_m2          # Apple Silicon runner (arm64 native build)
+    max_build_duration: 60
+
+    environment:
+      xcode: latest                     # newest Xcode + macOS SDK (needed for MetalFX)
+      vars:
+        UPSTREAM_REPO: "https://github.com/imCinq/pure-metal.git"
+        UPSTREAM_REF: "v0.4.4.1"        # tag, branch or commit to build
+        JDK_MAJOR: "25"                 # Pure Metal requires Java 25
+        SRC_DIR: "pure-metal-src"       # checkout folder inside $CM_BUILD_DIR
+        OUT_DIR: "artifacts"            # collected output folder inside $CM_BUILD_DIR
+
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true
+
+    scripts:
+      - name: Show machine and toolchain info
+        script: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          clang --version
+          git --version
+
+      - name: Fetch upstream Pure Metal source
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          rm -rf "$SRC_DIR"
+          git clone "$UPSTREAM_REPO" "$SRC_DIR"
+          cd "$SRC_DIR"
+          git checkout --detach "$UPSTREAM_REF"
+          echo "Building commit: $(git rev-parse HEAD)"
+          grep -E '^(version|minecraft_version|loader_version|loom_version)=' gradle.properties
+
+      - name: Install JDK (Temurin)
+        script: |
+          set -euo pipefail
+          JDK_HOME_DIR="$HOME/jdk-$JDK_MAJOR"
+          if [ ! -x "$JDK_HOME_DIR/Contents/Home/bin/java" ]; then
+            mkdir -p "$JDK_HOME_DIR"
+            curl -fsSL --retry 3 -o /tmp/jdk.tar.gz \
+              "https://api.adoptium.net/v3/binary/latest/${JDK_MAJOR}/ga/mac/aarch64/jdk/hotspot/normal/eclipse"
+            tar -xzf /tmp/jdk.tar.gz -C "$JDK_HOME_DIR" --strip-components=1
+          fi
+          JAVA_HOME_PATH="$JDK_HOME_DIR/Contents/Home"
+          "$JAVA_HOME_PATH/bin/java" -version
+          # Make JAVA_HOME / PATH available to the following steps.
+          echo "JAVA_HOME=$JAVA_HOME_PATH" >> "$CM_ENV"
+          echo "PATH=$JAVA_HOME_PATH/bin:$PATH" >> "$CM_ENV"
+
+      - name: Build native library and jar (Gradle)
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          chmod +x gradlew
+          # Force Java 25 for this step (do not rely on values from earlier steps).
+          export JAVA_HOME="$HOME/jdk-$JDK_MAJOR/Contents/Home"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          MAJOR="$(java -version 2>&1 | head -n 1 | sed -E 's/.*"([0-9]+).*/\1/')"
+          if [ "$MAJOR" -lt "$JDK_MAJOR" ]; then echo "ERROR: Java $MAJOR active, need $JDK_MAJOR"; exit 1; fi
+          # Runs: buildNative (clang -> libpuremetal.dylib), checks, and jar packaging.
+          mkdir -p "$CM_BUILD_DIR/logs"
+          ./gradlew build --no-daemon --console=plain \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            -Dorg.gradle.java.installations.paths="$JAVA_HOME" \
+            -Dorg.gradle.java.installations.auto-download=false 2>&1 | tee "$CM_BUILD_DIR/logs/gradle.log"
+          ls -la build/libs build/native
+
+      - name: Native tests (best effort - needs a GPU, may be skipped on VMs)
+        ignore_failure: true
+        script: |
+          set -uo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          FW="-framework Metal -framework MetalFX -framework QuartzCore -framework Foundation -framework AppKit -framework IOSurface"
+          if [ -f tools/test_present_credits.c ]; then
+            clang -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -pthread \
+              -framework CoreFoundation -framework IOSurface \
+              tools/test_present_credits.c -o /tmp/pm-present-credits && /tmp/pm-present-credits
+          fi
+          if [ -f tools/test_present_iosurface.m ]; then
+            clang -fobjc-arc -O1 -g -fsanitize=address -Wall -Wextra -Werror \
+              -framework Foundation -framework IOSurface \
+              tools/test_present_iosurface.m -o /tmp/pm-iosurface && /tmp/pm-iosurface
+          fi
+          if [ -f tools/test_metal4_surface_shutdown.m ]; then
+            clang -fobjc-arc -O1 -g -fsanitize=address -arch arm64 -mmacosx-version-min=14.0 $FW \
+              tools/test_metal4_surface_shutdown.m -o /tmp/pm-surface-shutdown && /tmp/pm-surface-shutdown
+          fi
+          if [ -f tools/test_unaligned_copy.m ]; then
+            clang -fobjc-arc -O2 -Wall -Werror -arch arm64 -mmacosx-version-min=14.0 $FW \
+              tools/test_unaligned_copy.m -o /tmp/pm-unaligned-copy && /tmp/pm-unaligned-copy
+          fi
+          exit 0
+
+      - name: Verify jar and native library
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          JAR="$(ls build/libs/pure-metal-*.jar | grep -v -E 'sources|benchmark' | head -n 1)"
+          echo "Jar: $JAR"
+          unzip -l "$JAR" | grep -E "fabric.mod.json|natives/libpuremetal.dylib|puremetal.mixins.json"
+          mkdir -p /tmp/pm-verify && rm -rf /tmp/pm-verify/*
+          unzip -q -o "$JAR" 'natives/libpuremetal.dylib' -d /tmp/pm-verify
+          DYLIB=/tmp/pm-verify/natives/libpuremetal.dylib
+          lipo -info "$DYLIB" | grep -q arm64
+          otool -l "$DYLIB" | grep -A3 LC_BUILD_VERSION | grep -q "platform macos"
+          otool -D "$DYLIB" | grep -q "@rpath/libpuremetal.dylib"
+          nm -gU "$DYLIB" | grep -q " T _pm_device_create"
+          nm -gU "$DYLIB" | grep -q " T _pm_surface_create"
+          nm -gU "$DYLIB" | grep -q " T _pm_pass_draw"
+          echo "Exported _pm_* functions: $(nm -gU "$DYLIB" | grep -c ' T _pm_')"
+          echo "Verification passed."
+
+      - name: Collect artifacts
+        script: |
+          set -euo pipefail
+          SRC="$CM_BUILD_DIR/$SRC_DIR"
+          OUT="$CM_BUILD_DIR/$OUT_DIR"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          cp "$SRC"/build/libs/pure-metal-*.jar "$OUT"/
+          cp "$SRC/build/native/libpuremetal.dylib" "$OUT"/
+          nm -gU "$OUT/libpuremetal.dylib" > "$OUT/exports.txt"
+          cp "$SRC/LICENSE" "$SRC/NOTICE" "$OUT"/
+          (cd "$OUT" && shasum -a 256 *.jar libpuremetal.dylib > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          ls -la "$OUT"
+
+    artifacts:
+      - artifacts/*.jar
+      - artifacts/libpuremetal.dylib
+      - artifacts/exports.txt
+      - artifacts/SHA256SUMS.txt
+      - artifacts/LICENSE
+      - artifacts/NOTICE
+      - logs/gradle.log
+
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com      # <- replace with your email address
+        notify:
+          success: true
+          failure: true
+
+  # ---------------------------------------------------------------------------
+  # iOS variant: compiles the SAME upstream puremetal.m for iPhone (arm64, iOS 16+)
+  # and also repacks the jar with the iOS dylib. The native code only uses Metal,
+  # QuartzCore, MetalFX, Foundation and IOSurface (no AppKit code), so it should
+  # compile for iOS, but this is UNTESTED: the Java side must also be loaded by an
+  # iOS launcher that provides Java 25, Fabric and an SDL Metal layer.
+  # ---------------------------------------------------------------------------
+  # iOS black-screen fix: pm_surface_create is auto-patched to draw into the SDL Metal layer
+  # (or an overlay CAMetalLayer on the key window). See logs/ios-autopatch.txt after the build.
+  pure-metal-ios:
+    name: Pure Metal - iOS arm64 dylib + repacked jar
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+
+    environment:
+      xcode: latest
+      vars:
+        UPSTREAM_REPO: "https://github.com/imCinq/pure-metal.git"
+        UPSTREAM_REF: "v0.4.4.1"
+        JDK_MAJOR: "25"
+        MIN_IOS: "16.0"                 # MetalFX needs iOS 16+
+        SRC_DIR: "pure-metal-src"
+        OUT_DIR: "artifacts-ios"
+
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper
+
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true
+
+    scripts:
+      - name: Show machine and toolchain info
+        script: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Fetch upstream Pure Metal source
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          rm -rf "$SRC_DIR"
+          git clone "$UPSTREAM_REPO" "$SRC_DIR"
+          cd "$SRC_DIR"
+          git checkout --detach "$UPSTREAM_REF"
+          echo "Building commit: $(git rev-parse HEAD)"
+
+      - name: Install JDK (Temurin)
+        script: |
+          set -euo pipefail
+          JDK_HOME_DIR="$HOME/jdk-$JDK_MAJOR"
+          if [ ! -x "$JDK_HOME_DIR/Contents/Home/bin/java" ]; then
+            mkdir -p "$JDK_HOME_DIR"
+            curl -fsSL --retry 3 -o /tmp/jdk.tar.gz \
+              "https://api.adoptium.net/v3/binary/latest/${JDK_MAJOR}/ga/mac/aarch64/jdk/hotspot/normal/eclipse"
+            tar -xzf /tmp/jdk.tar.gz -C "$JDK_HOME_DIR" --strip-components=1
+          fi
+          JAVA_HOME_PATH="$JDK_HOME_DIR/Contents/Home"
+          "$JAVA_HOME_PATH/bin/java" -version
+          echo "JAVA_HOME=$JAVA_HOME_PATH" >> "$CM_ENV"
+          echo "PATH=$JAVA_HOME_PATH/bin:$PATH" >> "$CM_ENV"
+
+      - name: Build the Java part (jar, macOS dylib inside)
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          chmod +x gradlew
+          # Force Java 25 for this step (do not rely on values from earlier steps).
+          export JAVA_HOME="$HOME/jdk-$JDK_MAJOR/Contents/Home"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          MAJOR="$(java -version 2>&1 | head -n 1 | sed -E 's/.*"([0-9]+).*/\1/')"
+          if [ "$MAJOR" -lt "$JDK_MAJOR" ]; then echo "ERROR: Java $MAJOR active, need $JDK_MAJOR"; exit 1; fi
+          mkdir -p "$CM_BUILD_DIR/logs"
+          ./gradlew jar --no-daemon --console=plain \
+            -Dorg.gradle.java.home="$JAVA_HOME" \
+            -Dorg.gradle.java.installations.paths="$JAVA_HOME" \
+            -Dorg.gradle.java.installations.auto-download=false 2>&1 | tee "$CM_BUILD_DIR/logs/gradle.log"
+          ls -la build/libs
+
+      - name: Write iOS layer shim header
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          mkdir -p build/ios-shim
+          # pm_ios_resolve_layer(handle): returns the CAMetalLayer that Pure Metal must draw into.
+          #  1. a CAMetalLayer/UIView of the app windows whose address equals `handle` (the handle is
+          #     only COMPARED, never dereferenced, so a wrong handle cannot crash)
+          #  2. otherwise the first CAMetalLayer view found in the app windows (SDL_WINDOW_METAL view)
+          #  3. otherwise a new CAMetalLayer overlay added to the key window (always visible)
+          cat > build/ios-shim/pm_ios_shim.h <<'SHIM'
+          #pragma once
+          #import <UIKit/UIKit.h>
+          #import <QuartzCore/CAMetalLayer.h>
+          #import <Metal/Metal.h>
+
+          static CAMetalLayer *pm_ios_overlay;
+
+          __attribute__((unused))
+          static void pm_ios_collect(UIView *v, NSMutableArray<UIView *> *out) {
+            if ([v.layer isKindOfClass:[CAMetalLayer class]]) [out addObject:v];
+            for (UIView *s in v.subviews) pm_ios_collect(s, out);
+          }
+
+          __attribute__((unused))
+          static void pm_ios_prepare(CAMetalLayer *l, CGFloat scale) {
+            l.opaque = YES;
+            if (scale < 1) scale = UIScreen.mainScreen.nativeScale;
+            l.contentsScale = scale;
+            if (l.drawableSize.width < 1 || l.drawableSize.height < 1)
+              l.drawableSize = CGSizeMake(l.bounds.size.width * scale, l.bounds.size.height * scale);
+          }
+
+          __attribute__((unused))
+          static void *pm_ios_pick_main(void *handle) {
+            NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
+            for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
+              if ([sc isKindOfClass:[UIWindowScene class]])
+                [wins addObjectsFromArray:((UIWindowScene *)sc).windows];
+            NSMutableArray<UIView *> *views = [NSMutableArray array];
+            for (UIWindow *w in wins) pm_ios_collect(w, views);
+            for (UIView *v in views) {
+              if ((__bridge void *)v == handle || (__bridge void *)v.layer == handle) {
+                pm_ios_prepare((CAMetalLayer *)v.layer, v.contentScaleFactor);
+                return (__bridge void *)v.layer;
+              }
+            }
+            if (views.count > 0) {
+              UIView *v = views.firstObject;
+              pm_ios_prepare((CAMetalLayer *)v.layer, v.contentScaleFactor);
+              return (__bridge void *)v.layer;
+            }
+            if (pm_ios_overlay) return (__bridge void *)pm_ios_overlay;
+            UIWindow *win = nil;
+            for (UIWindow *w in wins) if (w.isKeyWindow) { win = w; break; }
+            if (!win) win = wins.firstObject;
+            if (!win) return NULL;
+            CGFloat s = win.screen.nativeScale;
+            CAMetalLayer *l = [CAMetalLayer layer];
+            l.device = MTLCreateSystemDefaultDevice();
+            l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            l.framebufferOnly = YES;
+            l.opaque = YES;
+            l.contentsScale = s;
+            l.frame = win.bounds;
+            l.drawableSize = CGSizeMake(win.bounds.size.width * s, win.bounds.size.height * s);
+            l.zPosition = 1000;
+            [win.layer addSublayer:l];
+            pm_ios_overlay = l;
+            return (__bridge void *)l;
+          }
+
+          __attribute__((unused))
+          static void *pm_ios_resolve_layer(void *handle) {
+            __block void *result = handle;
+            void (^work)(void) = ^{
+              void *r = pm_ios_pick_main(handle);
+              if (r) result = r;
+            };
+            if ([NSThread isMainThread]) work();
+            else dispatch_sync(dispatch_get_main_queue(), work);
+            return result;
+          }
+          SHIM
+
+      - name: Auto-patch pm_surface_create for iOS (layer resolve)
+        ignore_failure: true
+        script: |
+          set -uo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          mkdir -p build "$CM_BUILD_DIR/logs"
+          cp src/main/native/puremetal.m build/puremetal.m.orig
+          python3 - <<'PY' 2>&1 | tee "$CM_BUILD_DIR/logs/ios-autopatch.txt"
+          import re, sys
+          p = "src/main/native/puremetal.m"
+          s = open(p, encoding="utf-8").read()
+          m = re.search(r'^[^\n;{}#/]*\bpm_surface_create\s*\(([^)]*)\)\s*\{', s, re.M)
+          if not m:
+              print("AUTOPATCH SKIPPED: pm_surface_create definition not found"); sys.exit(0)
+          print("signature:", m.group(0).strip().splitlines()[0])
+          params = []
+          for raw in m.group(1).split(","):
+              raw = raw.strip()
+              pm = re.match(r'^(.*?)(\w+)$', raw)
+              if pm and pm.group(1).strip():
+                  params.append((pm.group(1).strip(), pm.group(2)))
+          if not params:
+              print("AUTOPATCH SKIPPED: could not parse parameters"); sys.exit(0)
+          chosen = None
+          for key in ("layer", "view", "window", "handle", "native", "ptr"):
+              for t, n in params:
+                  if key in n.lower():
+                      chosen = (t, n); break
+              if chosen: break
+          if not chosen:
+              for t, n in params:
+                  if "*" in t and not re.search(r'dev|ctx|config|out|callback|cb', n.lower()):
+                      chosen = (t, n); break
+          if not chosen:
+              print("AUTOPATCH SKIPPED: no layer/window parameter found in", params); sys.exit(0)
+          t, n = chosen
+          print("layer parameter:", t, n)
+          if re.search(r'CAMetalLayer|\bid\b|NSObject|UIView|NSView', t):
+              base = re.sub(r'\b(const|_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained)\b', '', t).strip()
+              stmt = f"  {n} = (__bridge {base})pm_ios_resolve_layer((__bridge void *){n});"
+          elif "*" in t:
+              stmt = f"  {n} = pm_ios_resolve_layer((void *){n});"
+          else:
+              stmt = f"  {n} = ({t})(uintptr_t)pm_ios_resolve_layer((void *)(uintptr_t){n});"
+          ins = "\n#if defined(PM_IOS)\n" + stmt + "\n#endif\n"
+          s = s[:m.end()] + ins + s[m.end():]
+          open(p, "w", encoding="utf-8").write(s)
+          print("AUTOPATCH APPLIED:", stmt.strip())
+          PY
+          exit 0
+
+      - name: Dump surface/layer code (diagnostic, never fails)
+        ignore_failure: true
+        script: |
+          set -uo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          D="$CM_BUILD_DIR/logs/surface-dump.txt"
+          {
+            echo "===== native: layer / window / present usage (after autopatch) ====="
+            grep -n -E "pm_ios_|pm_surface_|CAMetalLayer|nextDrawable|drawableSize|contentsScale|NSWindow|NSView|UIView|\.layer|setLayer|setContents|presentDrawable" src/main/native/puremetal.m
+            echo
+            echo "===== native: pm_surface_create / pm_surface_configure ====="
+            for fn in pm_surface_create pm_surface_configure; do
+              n="$(grep -n -E "^[A-Za-z_].*[ *]${fn}[ ]*\(" src/main/native/puremetal.m | head -n 1 | cut -d: -f1)"
+              if [ -n "$n" ]; then echo "--- $fn (line $n) ---"; sed -n "${n},$((n+90))p" src/main/native/puremetal.m; fi
+            done
+            echo
+            echo "===== java: window handle ====="
+            grep -rn -E "pm_surface_create|glfwGetCocoa|Cocoa|SDL_Metal|SDL_GetWindow|nativeWindow|windowHandle|NSWindow|CAMetalLayer" src/main/java 2>/dev/null | head -n 80
+          } > "$D" 2>&1
+          wc -l "$D"
+
+      - name: Compile libpuremetal.dylib for iOS (arm64)
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR/$SRC_DIR"
+          mkdir -p build/native-ios build/ios-shim/IOSurface
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          # The iOS SDK ships no public IOSurface headers (only the framework stub).
+          # Pure Metal only needs IOSurfaceRef, IOSurfaceID and IOSurfaceGetID, so we
+          # provide a tiny shim header; the symbol comes from the system IOSurface framework.
+          cat > build/ios-shim/IOSurface/IOSurface.h <<'SHIM'
+          #pragma once
+          #include <CoreFoundation/CoreFoundation.h>
+          #include <stdint.h>
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          typedef struct __IOSurface *IOSurfaceRef;
+          typedef uint32_t IOSurfaceID;
+          IOSurfaceID IOSurfaceGetID(IOSurfaceRef buffer);
+          #ifdef __cplusplus
+          }
+          #endif
+          SHIM
+          # iOS has no CAMetalLayer.displaySyncEnabled (macOS only): compile that line out on iOS.
+          apply_ios_ifdefs() {
+            perl -0pi -e 's/^([ \t]*l\.displaySyncEnabled = displaySync \? YES : NO;)/#if !TARGET_OS_IPHONE\n$1\n#endif/m' src/main/native/puremetal.m
+          }
+          # Same flags as upstream build.gradle, but iOS SDK/target, no AppKit,
+          # and without -Werror so SDK warning differences do not fail the build.
+          compile_ios() {
+            xcrun --sdk iphoneos clang -dynamiclib -fobjc-arc -O2 \
+              -target "arm64-apple-ios${MIN_IOS}" -isysroot "$SDK" -I build/ios-shim -DPM_IOS=1 \
+              -install_name @rpath/libpuremetal.dylib -Wall \
+              $1 \
+              -framework Metal -framework MetalFX -framework QuartzCore \
+              -framework Foundation -framework IOSurface -framework CoreGraphics -framework UIKit \
+              -o build/native-ios/libpuremetal.dylib \
+              src/main/native/puremetal.m
+          }
+          apply_ios_ifdefs
+          grep -n -B1 -A1 "displaySyncEnabled" src/main/native/puremetal.m || true
+          if ! compile_ios "-include build/ios-shim/pm_ios_shim.h"; then
+            echo "WARNING: build with the layer fix failed, rebuilding the original source without it"
+            cp build/puremetal.m.orig src/main/native/puremetal.m
+            apply_ios_ifdefs
+            compile_ios ""
+          fi
+          codesign --force --sign - build/native-ios/libpuremetal.dylib   # ad-hoc; re-sign when sideloading
+          file build/native-ios/libpuremetal.dylib
+          otool -L build/native-ios/libpuremetal.dylib
+          if strings build/native-ios/libpuremetal.dylib | grep -q "connectedScenes"; then
+            echo "LAYER FIX: PRESENT in this dylib"
+          else
+            echo "LAYER FIX: NOT in this dylib (autopatch skipped or fell back) - see logs/ios-autopatch.txt"
+          fi
+
+      - name: Verify the iOS dylib
+        ignore_failure: true            # sanity check only: print results, never block the repack/artifacts
+        script: |
+          set -uo pipefail
+          D="$CM_BUILD_DIR/$SRC_DIR/build/native-ios/libpuremetal.dylib"
+          ls -la "$D"
+          lipo -info "$D"
+          otool -l "$D" | grep -A4 LC_BUILD_VERSION
+          otool -D "$D"
+          SYMS="$(nm -gU "$D")"
+          for f in _pm_device_create _pm_surface_create _pm_pass_draw; do
+            if echo "$SYMS" | grep -q " T $f"; then echo "OK  $f"; else echo "MISSING  $f"; fi
+          done
+          echo "Exported _pm_* functions: $(echo "$SYMS" | grep -c ' T _pm_')"
+          exit 0
+
+      - name: Repack jar with the iOS dylib and collect artifacts
+        script: |
+          set -euo pipefail
+          SRC="$CM_BUILD_DIR/$SRC_DIR"
+          OUT="$CM_BUILD_DIR/$OUT_DIR"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          JAR="$(ls "$SRC"/build/libs/pure-metal-*.jar | grep -v -E 'sources|benchmark' | head -n 1)"
+          IOS_JAR="$OUT/$(basename "${JAR%.jar}")-ios.jar"
+          cp "$JAR" "$IOS_JAR"
+          # Replace natives/libpuremetal.dylib inside the jar with the iOS build.
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/natives"
+          cp "$SRC/build/native-ios/libpuremetal.dylib" "$STAGE/natives/libpuremetal.dylib"
+          (cd "$STAGE" && zip -q "$IOS_JAR" natives/libpuremetal.dylib)
+          unzip -l "$IOS_JAR" | grep natives/libpuremetal.dylib
+          cp "$SRC/build/native-ios/libpuremetal.dylib" "$OUT/libpuremetal-ios.dylib"
+          nm -gU "$OUT/libpuremetal-ios.dylib" > "$OUT/exports-ios.txt"
+          cp "$SRC/LICENSE" "$SRC/NOTICE" "$OUT"/
+          (cd "$OUT" && shasum -a 256 *.jar *.dylib > SHA256SUMS.txt && cat SHA256SUMS.txt)
+
+    artifacts:
+      - artifacts-ios/*.jar
+      - artifacts-ios/libpuremetal-ios.dylib
+      - artifacts-ios/exports-ios.txt
+      - artifacts-ios/SHA256SUMS.txt
+      - artifacts-ios/LICENSE
+      - artifacts-ios/NOTICE
+      - logs/gradle.log
+      - logs/surface-dump.txt
+      - logs/ios-autopatch.txt
+
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com      # <- replace with your email address
+        notify:
+          success: true
+          failure: true
